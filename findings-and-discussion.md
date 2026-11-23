@@ -82,3 +82,67 @@ In the `mesh-llm` native runtime (`llama.cpp` + Skippy ABI):
 ### Query 4: Streaming Responsiveness for Coding Agents
 * **TTFT of 40.6 ms**: Shows that time-to-first-token is negligible on LAN clusters.
 * **Agent Suitability**: Tools like Claude Code, Goose, and OpenCode require low latency and high consistency. At ~5.8 tokens/sec, distributed inference on 27B dense models provides a viable, zero-cloud-cost alternative to API providers for coding and reasoning tasks.
+
+---
+
+## 4. Concurrency Evaluation & Multi-Stream Mechanics
+
+### A. The Concurrency Test (Dispatched Simultaneous Streams)
+When testing concurrent request bursts against the 3-node cluster configured with `--ctx-size 16384`:
+* **Dispatched**: 2 simultaneous requests, then 4 simultaneous requests.
+* **Error Encountered**:
+  ```json
+  HTTP 502: {"error":{"message":"persistent downstream lane did not become ready","type":"server_error","code":"service_unavailable"}}
+  ```
+* **Underlying Cause**:
+  - In `mesh-llm`, every concurrent stream requires its own independent KV cache buffer and dedicated QUIC multiplexed stream (`lane_count`).
+  - At **16k context**, a single lane requires **~5.1 GB of KV cache** across the 3 nodes. Allocating 2 or 4 lanes would require 10–20 GB of KV cache, exceeding the total 34 GB cluster limit.
+  - To prevent OOM crashes, the planner constrained the pipeline to **`lane_count: 1`**.
+  - When two requests arrived at the exact same millisecond, Request 2 attempted to acquire a non-existent second downstream lane, causing a socket buffer overflow (`failed to fill whole buffer`).
+
+### B. Concurrency Strategy Recommendations
+1. **FIFO Request Queuing (For 16k Context)**:
+   In realistic team use, requests rarely arrive at the identical millisecond. A lightweight reverse proxy with `max_concurrency = 1` queues incoming prompts cleanly.
+2. **True Parallel Multiplexing (`lane_count: 4`)**:
+   Lowering context to `--ctx-size 4096` reduces KV cache footprint to ~1.2 GB per stream, allowing the planner to allocate **4 simultaneous execution lanes** without queuing.
+
+---
+
+## 5. Node Churn & Resilience: What Happens if Mac Drops?
+
+### A. Immediate Pipeline Invalidation
+Because Mac hosts **Layers 31–63**, dropping the Mac node physically severs the sequential execution pipeline. In-flight queries fail with a transport disconnect (`peer disconnected`).
+
+### B. Auto-Rebalance Attempt & Physical Capacity Shortfall
+The coordinator's gossip protocol immediately attempts to re-plan the 64 layers across the remaining alive nodes (Windows + Omarchy):
+* **Windows Usable VRAM**: 11.6 GB
+* **Omarchy Usable VRAM**: 4.0 GB
+* **Combined VRAM**: **15.6 GB**
+* **Qwen 27B Weights (Q4_K_XL)**: **17.6 GB**
+
+Because $15.6\text{ GB} < 17.6\text{ GB}$, the raw model weights cannot fit into physical memory even at zero context. The coordinator logs `split_capacity_shortfall: no topology can distribute all layers` and enters a waiting standby state.
+
+### C. Automatic Self-Healing on Reconnect
+`mesh-llm` does not require restarting the coordinator. The moment Mac turns back on and rejoins:
+1. The coordinator detects the restored ~34 GB pool.
+2. It automatically re-plans the 3-stage partition.
+3. Downstream stages reload and signal readiness.
+4. The cluster returns to `Serving` status on its own.
+
+---
+
+## 6. Upcoming Experiment: NVIDIA-Only Architecture (Windows + Omarchy)
+
+### Hypothesis: Does a Pure CUDA Pipeline Beat Heterogeneous CUDA + Metal?
+* **Concept**: Does eliminating Apple Silicon (Metal/Accelerate) in favor of a homogeneous NVIDIA-only pipeline (Windows CUDA + Linux CUDA) yield higher decode throughput?
+* **Factors to Measure**:
+  1. **Kernel Homogeneity**: Uniform cuBLAS matrix multiplication kernels vs. bridging CUDA activation frames to Apple Metal.
+  2. **Memory Bandwidth Differences**: Apple Silicon unified memory (M-series ~150–200 GB/s) vs. Desktop RTX 3060 (340 GB/s) vs. Laptop RTX 3060 (325 GB/s).
+  3. **Network Latency**: Direct Windows-to-Linux LAN latency (~2–7 ms).
+
+### Important Sizing Note for the NVIDIA-Only Test
+Because Windows + Omarchy provide **15.6 GB usable VRAM**:
+* **27B Model**: Cannot fit on Windows + Omarchy alone (requires 17.6 GB for weights).
+* **Recommended Models for Pure NVIDIA Test**:
+  - **`Qwen2.5-Coder-14B-Instruct-GGUF` (~8.5 GB weights)**: Leaves **~7 GB of VRAM** for a massive 16k context window and multiple concurrent lanes across the two NVIDIA GPUs.
+  - **`DeepSeek-R1-Distill-Qwen-14B-GGUF` (~9.0 GB weights)**: Ideal for testing pure CUDA reasoning throughput.
